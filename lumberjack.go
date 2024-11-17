@@ -3,7 +3,7 @@
 // Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
 // thusly:
 //
-//   import "gopkg.in/natefinch/lumberjack.v2"
+//	import "gopkg.in/natefinch/lumberjack.v2"
 //
 // The package name remains simply lumberjack, and the code resides at
 // https://github.com/natefinch/lumberjack under the v2.0 branch.
@@ -66,7 +66,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
 // use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
 //
-// Cleaning Up Old Log Files
+// # Cleaning Up Old Log Files
 //
 // Whenever a new logfile gets created, old log files may be deleted.  The most
 // recent files according to the encoded timestamp will be retained, up to a
@@ -107,6 +107,18 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	// FileNameFormat such as: 'app.%DATE%.public.log'
+	FileNameFormat string
+	// BackupTimeFormat such as: '2006-01-02T15-04-05.000'
+	BackupTimeFormat string
+
+	// date rotate
+	DisableDateRotate bool
+	LastRotateDate    time.Time
+	DateRotateType    DateRotateType
+
+	stopChan chan bool
+
 	size int64
 	file *os.File
 	mu   sync.Mutex
@@ -126,6 +138,10 @@ var (
 	// variable so tests can mock it out and not need to write megabytes of data
 	// to disk.
 	megabyte = 1024 * 1024
+)
+
+const (
+	placeholderDate = "%DATE%"
 )
 
 // Write implements io.Writer.  If a write would cause the log file to be larger
@@ -165,6 +181,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.StopAutoRotate()
 	return l.close()
 }
 
@@ -218,7 +235,7 @@ func (l *Logger) openNew() error {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
 		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname := l.backupName(name, l.LocalTime)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -244,18 +261,24 @@ func (l *Logger) openNew() error {
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
 // (otherwise UTC).
-func backupName(name string, local bool) string {
-	dir := filepath.Dir(name)
-	filename := filepath.Base(name)
-	ext := filepath.Ext(filename)
-	prefix := filename[:len(filename)-len(ext)]
+func (l *Logger) backupName(name string, local bool) string {
 	t := currentTime()
 	if !local {
 		t = t.UTC()
 	}
 
-	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	if l.FileNameFormat != "" {
+		timestamp := t.Format(l.BackupTimeFormat)
+		return strings.ReplaceAll(l.FileNameFormat, placeholderDate, timestamp)
+	} else {
+		dir := filepath.Dir(name)
+		filename := filepath.Base(name)
+		ext := filepath.Ext(filename)
+		prefix := filename[:len(filename)-len(ext)]
+
+		timestamp := t.Format(l.BackupTimeFormat)
+		return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	}
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
@@ -538,4 +561,94 @@ func (b byFormatTime) Swap(i, j int) {
 
 func (b byFormatTime) Len() int {
 	return len(b)
+}
+
+type DateRotateType string
+
+var (
+	DateRotateType1Min  DateRotateType = "1m"
+	DateRotateType1Hour DateRotateType = "1h"
+	DateRotateType1Day  DateRotateType = "1d"
+)
+
+func (l *Logger) shouldRotateDate() bool {
+	timeNow := currentTime()
+	if !l.LocalTime {
+		timeNow = timeNow.UTC()
+	}
+
+	switch l.DateRotateType {
+	case DateRotateType1Min:
+		return timeNow.Before(l.LastRotateDate.Add(1 * time.Minute))
+	case DateRotateType1Hour:
+		return timeNow.Before(l.LastRotateDate.Add(1 * time.Hour))
+	case DateRotateType1Day:
+		return timeNow.Before(l.LastRotateDate.Add(24 * time.Hour))
+	}
+	return false
+}
+
+func (l *Logger) resetNextRotateDate() {
+	switch l.DateRotateType {
+	case DateRotateType1Min:
+		l.LastRotateDate = l.LastRotateDate.Add(1 * time.Minute)
+	case DateRotateType1Hour:
+		l.LastRotateDate = l.LastRotateDate.Add(1 * time.Hour)
+	case DateRotateType1Day:
+		l.LastRotateDate = l.LastRotateDate.Add(24 * time.Hour)
+	}
+}
+
+func GetCurrentRotateDateByType(t DateRotateType, local bool) time.Time {
+	timeNow := currentTime()
+	if !local {
+		timeNow = timeNow.UTC()
+	}
+
+	switch t {
+	case DateRotateType1Min:
+		return timeNow.Truncate(time.Minute)
+	case DateRotateType1Hour:
+		return timeNow.Truncate(time.Hour)
+	case DateRotateType1Day:
+		return timeNow.Truncate(24 * time.Hour)
+	}
+	return timeNow.Truncate(24 * time.Hour)
+}
+
+func (l *Logger) AutoRotate() {
+	go l.startAutoRotate()
+}
+
+func (l *Logger) startAutoRotate() {
+	if l.DisableDateRotate {
+		return
+	}
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if l.shouldRotateDate() {
+				l.resetNextRotateDate()
+				if l.size > 0 {
+					err := l.rotate()
+					if err != nil {
+						fmt.Printf("error rotating log: %v", err)
+						return
+					}
+				}
+			}
+
+		case <-l.stopChan:
+			// Receive a stop signal and exit the Goroutine
+			return
+		}
+	}
+}
+
+func (l *Logger) StopAutoRotate() {
+	l.stopChan <- true
 }
